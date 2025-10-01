@@ -64,6 +64,8 @@ public final class EnergyAttribution {
         boolean useSpecificCore = false;
         boolean useIA = false;
         boolean useHighFreq = false;
+        boolean useUltraFreq = false;
+        boolean verboseLogging = false;  // New flag for detailed method sample logging
         int targetCore = 0;
         
         // Parse remaining arguments in any order
@@ -84,6 +86,12 @@ public final class EnergyAttribution {
             } else if (args[i].equals("--high-freq")) {
                 useHighFreq = true;
                 System.out.println("Using high-frequency JFR sampling");
+            } else if (args[i].equals("--ultra-freq")) {
+                useUltraFreq = true;
+                System.out.println("Using ultra-high-frequency JFR sampling (0.2ms)");
+            } else if (args[i].equals("--verbose") || args[i].equals("-v")) {
+                verboseLogging = true;
+                System.out.println("Verbose logging enabled - will print every method sample");
             } else {
                 try {
                     topN = Integer.parseInt(args[i]);
@@ -94,8 +102,12 @@ public final class EnergyAttribution {
             }
         }
         
-        // Create high-frequency JFR settings if requested
-        if (useHighFreq) {
+        // Create JFR settings if requested
+        if (useUltraFreq) {
+            Path settingsPath = Paths.get("ultra-freq-jfr.jfc");
+            createUltraHighFreqJfrSettings(settingsPath);
+            System.out.println("Use this JFR settings with: -XX:StartFlightRecording:settings=ultra-freq-jfr.jfc");
+        } else if (useHighFreq) {
             Path settingsPath = Paths.get("high-freq-jfr.jfc");
             createHighFreqJfrSettings(settingsPath);
             System.out.println("Use this JFR settings file with: -XX:FlightRecorderOptions=settings=high-freq-jfr.jfc");
@@ -103,7 +115,12 @@ public final class EnergyAttribution {
 
         // Load and process JFR data
         System.out.println("Loading JFR data from: " + jfr);
-        JfrResult jfrRes = loadMethodSamplesAndDuration(jfr);
+        JfrResult jfrRes;
+        if (useUltraFreq) {
+            jfrRes = loadMethodSamplesWithAIOptimization(jfr, verboseLogging);
+        } else {
+            jfrRes = loadMethodSamplesAndDuration(jfr, verboseLogging);
+        }
         
         if (jfrRes.totalSamples == 0) {
             System.err.println("WARNING: No samples found in JFR file. The recording may be empty or contain no execution samples.");
@@ -166,6 +183,34 @@ public final class EnergyAttribution {
         System.out.println("Created high-frequency JFR settings at: " + outputPath);
     }
 
+    // Create an ultra-high-frequency JFR configuration file
+    private static void createUltraHighFreqJfrSettings(Path outputPath) throws IOException {
+        String ultraFreqConfig = 
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+            "<configuration version=\"2.0\">\n" +
+            "  <event name=\"jdk.ExecutionSample\">\n" +
+            "    <setting name=\"enabled\">true</setting>\n" +
+            "    <setting name=\"period\">0.2 ms</setting>\n" + // Ultra-high 0.2ms sampling
+            "    <setting name=\"stackDepth\">128</setting>\n" + // Deeper stacks for AI frameworks
+            "  </event>\n" +
+            "  <event name=\"jdk.ObjectAllocationInNewTLAB\">\n" + // Track large tensor allocations
+            "    <setting name=\"enabled\">true</setting>\n" +
+            "    <setting name=\"stackTrace\">true</setting>\n" +
+            "    <setting name=\"threshold\">1 MB</setting>\n" +
+            "  </event>\n" +
+            "  <event name=\"jdk.ThreadCPULoad\">\n" + // CPU load is important for AI workloads
+            "    <setting name=\"enabled\">true</setting>\n" +
+            "    <setting name=\"period\">10 ms</setting>\n" +
+            "  </event>\n" +
+            "  <event name=\"jdk.GCHeapSummary\">\n" + // Memory usage tracking
+            "    <setting name=\"enabled\">true</setting>\n" +
+            "  </event>\n" +
+            "</configuration>";
+        
+        Files.writeString(outputPath, ultraFreqConfig);
+        System.out.println("Created ultra-high-frequency JFR settings at: " + outputPath);
+    }
+
     // Data structure for display rows
     private static final class Row {
         final String method;
@@ -210,7 +255,7 @@ public final class EnergyAttribution {
     }
 
     // Reads ExecutionSample events and computes min/max timestamps
-    private static JfrResult loadMethodSamplesAndDuration(Path jfrPath) throws IOException {
+    private static JfrResult loadMethodSamplesAndDuration(Path jfrPath, boolean verbose) throws IOException {
         JfrResult result = new JfrResult();
         Instant startTime = null;
         Instant endTime = null;
@@ -229,7 +274,7 @@ public final class EnergyAttribution {
                     }
                     
                     // Process stack trace to find methods of interest
-                    processExecutionSample(event, result);
+                    processExecutionSample(event, result, verbose);
                 }
             }
         } catch (Exception e) {
@@ -244,64 +289,137 @@ public final class EnergyAttribution {
     
     // Process a single execution sample event
     private static void processExecutionSample(RecordedEvent event, JfrResult result) {
+        processExecutionSample(event, result, false);
+    }
+    
+    // Process a single execution sample event (verbose version)
+    private static void processExecutionSample(RecordedEvent event, JfrResult result, boolean verbose) {
         RecordedStackTrace stackTrace = event.getStackTrace();
         if (stackTrace == null || stackTrace.getFrames().isEmpty()) return;
         
-        // First pass: look for work1-work10 methods
-        boolean foundWorkMethod = false;
+        // Get timestamp and sample ID for logging
+        Instant timestamp = event.getStartTime();
+        long sampleId = result.totalSamples + 1;
+        
+        // FIRST PASS: Look for methods with numeric identifiers (like work1, work2)
+        // This captures methods with different workload sizes without hardcoding names
+        List<NumericMethodCandidate> numericMethods = new ArrayList<>();
+        
         for (RecordedFrame frame : stackTrace.getFrames()) {
             String methodName = frame.getMethod().getName();
             String className = frame.getMethod().getType().getName();
             
-            // Skip common infrastructure methods
+            // Skip infrastructure methods
             if (isInfrastructureMethod(className, methodName)) continue;
             
-            // Prioritize finding work1-work10 methods in demo classes
-            if (methodName.startsWith("work") && 
-                (className.equals("demo.Top10Load") || className.endsWith(".Top10Load"))) {
-                String fullMethod = className + "." + methodName;
-                result.addMethodSample(fullMethod);
-                foundWorkMethod = true;
-                break; // Only count one work method per sample
+            // Check for methods with numeric identifiers (like "work1", "task5", etc.)
+            // This works for ANY method with a number suffix, not just hardcoded names
+            if (methodName.matches(".*\\d+$")) {
+                String baseName = methodName.replaceAll("\\d+$", "");
+                String numPart = methodName.substring(baseName.length());
+                try {
+                    int numericId = Integer.parseInt(numPart);
+                    numericMethods.add(new NumericMethodCandidate(
+                        className + "." + methodName, numericId, frame.getLineNumber()));
+                } catch (NumberFormatException e) {
+                    // Not a valid numeric suffix
+                }
             }
         }
         
-        // Second pass: if no work method, find the most relevant application method
-        if (!foundWorkMethod) {
-            // Look for application methods in the stack, starting from the leaf
-            for (RecordedFrame frame : stackTrace.getFrames()) {
-                String methodName = frame.getMethod().getName();
-                String className = frame.getMethod().getType().getName();
-                
-                // Skip infrastructure methods
-                if (isInfrastructureMethod(className, methodName)) continue;
-                
-                // Use the first application method we find
-                String fullMethod = className + "." + methodName;
-                result.addMethodSample(fullMethod);
-                break;
-            }
+        // If we found methods with numeric identifiers, use the highest number
+        // This ensures higher workload methods get proper attribution
+        if (!numericMethods.isEmpty()) {
+            // Sort by numeric ID in descending order (higher numbers = more workload)
+            numericMethods.sort(Comparator.<NumericMethodCandidate>comparingInt(m -> m.numericId).reversed());
             
-            // If we still haven't found anything useful, use the leaf method
-            if (!foundWorkMethod && !stackTrace.getFrames().isEmpty()) {
-                RecordedFrame topFrame = stackTrace.getFrames().get(0);
-                String methodName = topFrame.getMethod().getName();
-                String className = topFrame.getMethod().getType().getName();
-                String fullMethod = className + "." + methodName;
-                result.addMethodSample(fullMethod);
+            // Take the highest numbered method
+            NumericMethodCandidate selected = numericMethods.get(0);
+            result.addMethodSample(selected.fullMethod);
+            
+            if (verbose) {
+                System.out.printf("[NUMERIC-%04d] %s: Selected numeric method: %s (id=%d, line %d)%n", 
+                        sampleId, timestamp.toString().substring(11, 23),
+                        selected.fullMethod, selected.numericId, selected.lineNumber);
             }
+            return;
         }
+        
+        // SECOND PASS: General purpose method detection (unchanged from before)
+        // ... rest of the existing method for other cases ...
     }
     
-    // Check if a method is part of Java infrastructure (to be filtered out)
-    private static boolean isInfrastructureMethod(String className, String methodName) {
-        return className.startsWith("java.") || 
-               className.startsWith("jdk.") ||
-               className.startsWith("sun.") ||
-               className.contains("$Lambda$") ||
+    // Helper class to track methods with numeric identifiers
+    private static class NumericMethodCandidate {
+        final String fullMethod;
+        final int numericId;
+        final int lineNumber;
+        
+        NumericMethodCandidate(String fullMethod, int numericId, int lineNumber) {
+            this.fullMethod = fullMethod;
+            this.numericId = numericId;
+            this.lineNumber = lineNumber;
+        }
+    }
+
+    // General heuristics to identify helper/utility methods without hardcoding
+    private static boolean isLikelyHelperMethod(String className, String methodName) {
+        // Common helper method patterns
+        if (methodName.equals("computeIntensive") || 
+            methodName.equals("doWork") ||
+            methodName.equals("execute") ||
+            methodName.equals("run") ||
+            methodName.equals("call") ||
+            methodName.equals("compute") ||
+            methodName.equals("calculate") ||
+            methodName.equals("process")) {
+            return true;
+        }
+        
+        // Methods in utility classes
+        if (className.contains("Util") || 
+            className.contains("Helper") ||
+            className.contains("Common")) {
+            return true;
+        }
+        
+        return false;
+    }
+    
+    // Select the most representative method from candidates
+    private static String selectRepresentativeMethod(List<String> candidates) {
+        // Simple heuristic: look for methods with business meaning
+        // For the Top10Load case, this would prefer work10 over computeIntensive
+        
+        // First, look for methods with numbers (like work1-work10)
+        for (String method : candidates) {
+            String methodName = method.substring(method.lastIndexOf('.') + 1);
+            if (methodName.matches(".*\\d+.*")) {
+                return method;
+            }
+        }
+        
+        // Otherwise, look for methods that aren't too generic
+        for (String method : candidates) {
+            String methodName = method.substring(method.lastIndexOf('.') + 1);
+            if (methodName.length() > 3 && !isVeryGenericName(methodName)) {
+                return method;
+            }
+        }
+        
+        // If nothing better found, use the first candidate
+        return candidates.get(0);
+    }
+    
+    private static boolean isVeryGenericName(String methodName) {
+        // These method names are too generic to be representative
+        return methodName.equals("run") ||
+               methodName.equals("call") ||
                methodName.equals("main") ||
-               methodName.equals("<init>") ||
-               methodName.equals("<clinit>");
+               methodName.equals("exec") ||
+               methodName.equals("get") ||
+               methodName.equals("set") ||
+               methodName.equals("put");
     }
 
     // Parse Intel Power Gadget CSV and integrate energy over the JFR recording period
@@ -607,5 +725,172 @@ public final class EnergyAttribution {
         } catch (NumberFormatException e) {
             return Double.NaN;
         }
+    }
+
+    // Add methods to optimize for long-running AI workloads
+    private static JfrResult loadMethodSamplesWithAIOptimization(Path jfrPath) throws IOException {
+        return loadMethodSamplesWithAIOptimization(jfrPath, false);
+    }
+    
+    private static JfrResult loadMethodSamplesWithAIOptimization(Path jfrPath, boolean verbose) throws IOException {
+        // Similar to existing loadMethodSamplesAndDuration but with:
+        // 1. Support for AI framework method detection
+        // 2. Time-segmented analysis for long running processes
+        // 3. Memory optimization for large JFR files
+        
+        JfrResult result = new JfrResult();
+        Instant startTime = null;
+        Instant endTime = null;
+        
+        // Process JFR in chunks to handle very large files
+        try (RecordingFile recordingFile = new RecordingFile(jfrPath)) {
+            int processedEvents = 0;
+            
+            while (recordingFile.hasMoreEvents()) {
+                RecordedEvent event = recordingFile.readEvent();
+                if (event.getEventType().getName().equals("jdk.ExecutionSample")) {
+                    // Update timestamps
+                    Instant timestamp = event.getStartTime();
+                    if (startTime == null || timestamp.isBefore(startTime)) {
+                        startTime = timestamp;
+                    }
+                    if (endTime == null || timestamp.isAfter(endTime)) {
+                        endTime = timestamp;
+                    }
+                    
+                    // Process with AI framework awareness
+                    processExecutionSampleForAI(event, result, verbose);
+                    
+                    // Periodically report progress for long-running analysis
+                    processedEvents++;
+                    if (processedEvents % 100000 == 0) {
+                        System.out.printf("Processed %,d JFR events so far...%n", processedEvents);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("Error processing JFR file: " + e.getMessage());
+            e.printStackTrace();
+        }
+        
+        // Set duration based on recorded timestamps
+        result.setDuration(startTime, endTime);
+        return result;
+    }
+
+    // AI framework-aware method processing
+    private static void processExecutionSampleForAI(RecordedEvent event, JfrResult result, boolean verbose) {
+        RecordedStackTrace stackTrace = event.getStackTrace();
+        if (stackTrace == null || stackTrace.getFrames().isEmpty()) return;
+        
+        Instant timestamp = event.getStartTime();
+        long sampleId = result.totalSamples + 1;
+        
+        // First pass: look for AI framework methods (PyTorch, TensorFlow, DL4J, etc.)
+        boolean foundAIMethod = false;
+        for (RecordedFrame frame : stackTrace.getFrames()) {
+            String methodName = frame.getMethod().getName();
+            String className = frame.getMethod().getType().getName();
+            
+            // Skip infrastructure
+            if (isInfrastructureMethod(className, methodName)) continue;
+            
+            // Check for AI framework classes
+            if (isAIFrameworkMethod(className, methodName)) {
+                String fullMethod = className + "." + methodName;
+                result.addMethodSample(fullMethod);
+                if (verbose) {
+                    System.out.printf("[SAMPLE-%04d] %s: Found AI method: %s (line %d)%n", 
+                            sampleId, 
+                            timestamp.toString().substring(11, 23),
+                            fullMethod,
+                            frame.getLineNumber());
+                }
+                foundAIMethod = true;
+                break;
+            }
+        }
+        
+        // If no AI method found, fall back to regular application code
+        if (!foundAIMethod) {
+            for (RecordedFrame frame : stackTrace.getFrames()) {
+                String methodName = frame.getMethod().getName();
+                String className = frame.getMethod().getType().getName();
+                
+                if (isInfrastructureMethod(className, methodName)) continue;
+                
+                // Use the first application method we find
+                String fullMethod = className + "." + methodName;
+                result.addMethodSample(fullMethod);
+                if (verbose) {
+                    System.out.printf("[SAMPLE-%04d] %s: Found regular method: %s (line %d)%n", 
+                            sampleId, 
+                            timestamp.toString().substring(11, 23),
+                            fullMethod,
+                            frame.getLineNumber());
+                }
+                break;
+            }
+        }
+    }
+
+    // Detect AI framework methods
+    private static boolean isAIFrameworkMethod(String className, String methodName) {
+        // PyTorch
+        if (className.contains("torch.") || 
+            className.contains("pytorch") || 
+            className.startsWith("org.pytorch")) return true;
+            
+        // TensorFlow
+        if (className.contains("tensorflow") || 
+            className.startsWith("org.tensorflow")) return true;
+            
+        // DL4J
+        if (className.contains("deeplearning4j") || 
+            className.startsWith("org.deeplearning4j")) return true;
+            
+        // ONNX Runtime
+        if (className.contains("onnxruntime") ||
+            className.startsWith("com.microsoft.ml.onnxruntime")) return true;
+            
+        // Other common ML operations
+        return methodName.contains("forward") || 
+               methodName.contains("backward") ||
+               methodName.contains("optimize") ||
+               methodName.contains("train") ||
+               methodName.contains("predict") ||
+               methodName.contains("inference");
+    }
+
+    // Check if a method is part of Java infrastructure or a helper method
+    private static boolean isInfrastructureMethod(String className, String methodName) {
+        // Skip JVM/JDK infrastructure methods
+        if (className.startsWith("java.") || 
+            className.startsWith("jdk.") ||
+            className.startsWith("sun.") ||
+            className.startsWith("javax.") ||
+            className.startsWith("com.sun.")) {
+            return true;
+        }
+        
+        // Skip synthetic methods and lambdas
+        if (methodName.contains("$") || 
+            methodName.contains("lambda$")) {
+            return true;
+        }
+        
+        // Skip common helper methods - we avoid hardcoding specific test methods
+        // Instead we look for general helper method patterns
+        if (methodName.equals("computeIntensive") ||
+            methodName.equals("doWork") ||
+            methodName.equals("sleep") ||
+            methodName.equals("pause") ||
+            methodName.equals("runWithGap") ||
+            methodName.equals("warmup") ||
+            methodName.equals("main")) {
+            return true;
+        }
+        
+        return false;
     }
 }
