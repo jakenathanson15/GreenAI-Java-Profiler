@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?> 
+<configuration version="2.0"> 
+  <event name="jdk.ExecutionSample"> 
+    <setting name="enabled">true</setting> 
+    <setting name="period">1 ms</setting> 
+    <setting name="stackDepth">64</setting> 
+  </event> 
+</configuration> 
