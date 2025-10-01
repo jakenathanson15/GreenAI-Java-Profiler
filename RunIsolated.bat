@@ -1,0 +1,13 @@
+@echo off
+echo Setting up CPU affinity for Core 0...
+start "Java Top10Load" /AFFINITY 1 /HIGH /WAIT java -XX:StartFlightRecording:settings=high-freq-jfr.jfc,name=prof,filename=energy_results\profile-isolated.jfr,duration=30s -cp .\out demo.Top10Load
+
+echo Running Power Gadget...
+"C:\Program Files\Intel\Power Gadget 3.6\PowerLog3.0.exe" -duration 30 -resolution 100 -file energy_results\power-isolated.csv
+
+echo Analyzing isolated energy data...
+java -cp .\out demo.EnergyAttribution energy_results\profile-isolated.jfr energy_results\power-isolated.csv 10 --core 0
+
+echo.
+echo Press any key to exit...
+pause > nul
